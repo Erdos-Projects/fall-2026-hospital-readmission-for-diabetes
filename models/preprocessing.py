@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 def preprocess_data(df):
 
@@ -107,3 +108,179 @@ def import_data():
     
     print("Finished the import.")
     return Xt,yt,Xv,yv
+
+
+def group_diagnoses(df):
+    ranges = {"Circulatory": (390, 459), "Respiratory": (460, 519),
+        "Digestive": (520, 579), "Genitourinary": (580, 629),
+        "Musculoskeletal": (710, 739), "Neoplasms": (140, 239), "Injury": (800, 999)}
+    
+    symptoms = {785: "Circulatory", 786: "Respiratory", 787: "Digestive", 788: "Genitourinary"}
+
+    def categorize(value):
+        if pd.isna(value):
+            return "Missing"
+
+        code = str(value).strip().upper()
+        if code in {"", "?", "NAN", "NONE", "MISSING"}:
+            return "Missing"
+
+        # Supplementary V/E codes belong to the broad Other category.
+        if code.startswith(("V", "E")):
+            return "Other"
+
+        try:
+            number = float(code)
+            if not 1 <= number < 1000:
+                return "Other"
+            code = int(number)  # 250.13 -> 250, 459.9 -> 459
+        except ValueError:
+            return "Other"
+
+        if code == 250:
+            return "Diabetes"
+        if code in symptoms:
+            return symptoms[code]
+        for group, (lower, upper) in ranges.items():
+            if lower <= code <= upper:
+                return group
+        return "Other"
+
+    result = df.copy()
+    for column in ("diag_1", "diag_2", "diag_3", "diaga_3"):
+        if column in result.columns:
+            result[column] = result[column].map(categorize)
+
+    return result
+
+
+def group_medications(df):
+    groups = {
+        "biguanide": ["metformin"],
+        "meglitinide": ["repaglinide", "nateglinide"],
+        "sulfonylurea_gen1": ["chlorpropamide", "acetohexamide", "tolbutamide", "tolazamide"],
+        "sulfonylurea_gen2": ["glimepiride", "glipizide", "glyburide"],
+        "thiazolidinedione": ["pioglitazone", "rosiglitazone", "troglitazone"],
+        "alpha_glucosidase_inhibitor": ["acarbose", "miglitol"],
+        "biguanide_sulfonylurea_gen2": ["glyburide-metformin", "glipizide-metformin"],
+        "biguanide_thiazolidinedione": ["metformin-rosiglitazone", "metformin-pioglitazone"],
+        "sulfonylurea_gen2_thiazolidinedione": ["glimepiride-pioglitazone"],
+    }
+
+    result = df.copy()
+    priority = ["Up", "Down", "Steady"]
+
+    for group, medications in groups.items():
+        columns = df.columns.intersection(medications)
+        if len(columns):
+            values = df[columns]
+            result = result.drop(columns=columns)
+            result[group] = np.select([values.eq(status).any(axis=1) for status in priority], priority, default="No")
+
+    return result
+
+def engineer(df):
+    visits = [
+        "number_outpatient",
+        "number_emergency",
+        "number_inpatient",
+    ]
+
+    # Allow diminishing effects from additional previous visits.
+    for column in visits:
+        df[f"{column}_log1p"] = np.log1p(df[column])
+
+    df["eng_prior_visits_log1p"] = np.log1p(df[visits].sum(axis=1))
+    df["eng_prior_inpatient_any"] = (df["number_inpatient"] > 0).astype(int)
+    df["eng_prior_inpatient_2plus"] = (df["number_inpatient"] >= 2).astype(int)
+
+    # Let combined inpatient/emergency utilization have an additional effect.
+    df["eng_inpatient_emergency_interaction"] = (
+        df["number_inpatient_log1p"]
+        * df["number_emergency_log1p"]
+    )
+
+    # Distinguish intensity from total volume during the admission.
+    days = df["time_in_hospital"].clip(lower=1)
+    df["eng_medications_per_day"] = df["num_medications"] / days
+    df["eng_labs_per_day"] = df["num_lab_procedures"] / days
+
+    return df
+
+
+def features():
+    chosen_features = [
+    "number_inpatient",
+    "number_emergency",
+    "payer_code",
+    "discharge_disposition_id",
+    "diag_1",
+    "number_diagnoses",
+    "num_medications",
+    ]
+    return chosen_features
+
+
+def final_engineered(Xt,Xv):
+
+    """
+    Pass in the training set and validation/test set. Drops the enconter_id and/or the readmitted column if there.
+    Adds tons of features.
+    
+    Returns new Xt,Xv, and the list of features.
+    """
+
+    numeric = ["time_in_hospital", "num_lab_procedures", "num_procedures", "num_medications",
+            "number_outpatient", "number_emergency", "number_inpatient", "number_diagnoses"]
+    visits = ["number_outpatient", "number_emergency", "number_inpatient"]
+    diags = ["diag_1", "diag_2", "diag_3"]
+    drugs = Xt.loc[:, "metformin":"metformin-pioglitazone"].columns.tolist()
+
+    frames = []
+    for X in [Xt, Xv]:
+        X.drop(columns=["encounter_id", "readmitted"], errors="ignore", inplace=True)
+        grouped_diag = group_diagnoses(X)
+        grouped_med = group_medications(X)
+        for col in diags:
+            X[col + "_group"] = grouped_diag[col]
+        for col in grouped_med.columns.difference(X.columns):
+            X[col] = grouped_med[col]
+        engineer(X)
+        X["eng_total_visits"] = X[visits].sum(axis=1, min_count=3)
+        for col in visits:
+            X[col + "_bin"] = pd.cut(X[col], [-1, 0, 1, 2, 4, np.inf],
+                                    labels=["0", "1", "2", "3-4", "5+"]).astype(object)
+            X[col + "_share"] = X[col] / (1 + X["eng_total_visits"])
+        for col in numeric:
+            X[col + "_log1p"] = np.log1p(X[col])
+            X[col + "_squared"] = X[col] ** 2
+        X = X.copy()
+        for i, a in enumerate(numeric):
+            for b in numeric[i + 1:]:
+                X[a + "_x_" + b] = X[a + "_log1p"] * X[b + "_log1p"]
+        for col in ["num_procedures", "number_diagnoses"]:
+            X[col + "_per_day"] = X[col] / X["time_in_hospital"].clip(lower=1)
+        for status in ["No", "Steady", "Up", "Down"]:
+            X["eng_drugs_" + status] = X[drugs].eq(status).sum(axis=1)
+        X["eng_drugs_active"] = X[drugs].isin(["Steady", "Up", "Down"]).sum(axis=1)
+        X["eng_drugs_changed"] = X[drugs].isin(["Up", "Down"]).sum(axis=1)
+        X["eng_drugs_missing"] = X[drugs].isna().sum(axis=1)
+        X["eng_age_midpoint"] = pd.to_numeric(
+            X["age"].str.extract(r"\[(\d+)-", expand=False), errors="coerce") + 5
+        for a, b in [("diag_1_group", "a1cresult"), ("diag_1_group", "insulin"),
+                    ("age", "discharge_disposition_id"), ("insulin", "change"),
+                    ("admission_type_id", "admission_source_id")]:
+            X[a + "_with_" + b] = X[a].fillna("Missing").astype(str) + "|" + X[b].fillna("Missing").astype(str)
+        for col in diags + ["admission_type_id", "discharge_disposition_id", "admission_source_id"]:
+            X[col] = X[col].astype(str).where(X[col].notna(), np.nan)
+        for col in X.select_dtypes(exclude="number"):
+            X[col] = X[col].astype(object).where(X[col].notna(), np.nan)
+
+        frames.append(X)
+    Xt, Xv = frames
+
+    all_features = Xt.columns.tolist()
+
+
+
+    return Xt, Xv, all_features
