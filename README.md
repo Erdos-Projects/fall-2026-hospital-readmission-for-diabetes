@@ -98,11 +98,12 @@ The saved [`final_model.joblib`](results/final/final_model.joblib) contains the 
 
 | Path | Contents |
 | --- | --- |
-| `data/` | Original CSV files and prepared development and test splits in `cleaned_data/` |
+| `data/` | Original CSV files and prepared development and development/test splits in `cleaned_data/` |
 | `models/modeling_data/` | Prepared training and validation splits |
 | `models/preprocessing.py` and `models/scoring.py` | Shared data and scoring helpers |
 | `models/` | Baseline experiments, comparisons with other models, and tuning of models |
 | `notebooks/` | Exploratory analysis and feature-selection notebooks |
+| `results/` | Evaluation of models, executive summary, slides |
 | `results/final/` | Final baseline and light test notebooks, plus the exported light estimator |
 
 ## Limitations and sources
